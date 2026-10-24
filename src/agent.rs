@@ -56,7 +56,7 @@ impl Default for Config {
             max_tokens: 800,
             history_chars: 9000,
             require_plan: true,
-            bad_reply_limit: 2,
+            bad_reply_limit: 3,
             check_plan_before_final: true,
             delegate_calls: 8,
             summarize: false,
@@ -599,13 +599,7 @@ impl Agent {
 
     fn read(&self, text: &str) -> Result<Action, String> {
         let clean = strip_thinking(text);
-        let (Some(a), Some(z)) = (clean.find('{'), clean.rfind('}')) else {
-            return Err("the reply had no JSON object in it".into());
-        };
-        if z < a {
-            return Err("the reply had no JSON object in it".into());
-        }
-        let v: Value = serde_json::from_str(&clean[a..=z]).map_err(|_| "the reply was not valid JSON".to_string())?;
+        let v = first_action_object(&clean)?;
         if let Some(plan) = v.get("plan") {
             let steps: Vec<String> = plan
                 .as_array()
@@ -623,7 +617,7 @@ impl Agent {
         if let Some(f) = v.get("final") {
             return Ok(Action::Final(f.as_str().map(str::to_owned).unwrap_or_else(|| f.to_string())));
         }
-        let name = v.get("tool").and_then(Value::as_str).ok_or("the reply named no tool, plan or final")?;
+        let name = v.get("tool").and_then(Value::as_str).ok_or(r#"the reply named no tool, plan or final. Reply with exactly one of {"plan":["step", ...]}, {"tool":"<name>","args":{...}} or {"final":"what was done"}"#)?;
         let tool = self.visible().find(|t| t.name == name).ok_or_else(|| {
             let names: Vec<&str> = self.visible().map(|t| t.name.as_str()).collect();
             format!("there is no tool called {name}; the tools are {}", names.join(", "))
@@ -816,6 +810,57 @@ impl Agent {
         };
         Ok(a)
     }
+}
+
+/// The first JSON object in the text that looks like an answer (it has `plan`, `tool` or
+/// `final`), even when the model wrote words around it or a second object after it. Falls back
+/// to the first object that parses at all.
+fn first_action_object(text: &str) -> Result<Value, String> {
+    let bytes = text.as_bytes();
+    let mut first_ok: Option<Value> = None;
+    let mut from = 0;
+    while let Some(off) = text[from..].find('{') {
+        let start = from + off;
+        // Find the matching close, skipping braces inside strings.
+        let (mut depth, mut in_str, mut esc, mut end) = (0usize, false, false, None);
+        for (i, &b) in bytes.iter().enumerate().skip(start) {
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if b == b'\\' {
+                    esc = true;
+                } else if b == b'"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_str = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match end {
+            Some(e) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&text[start..=e]) {
+                    if v.get("plan").is_some() || v.get("tool").is_some() || v.get("final").is_some() {
+                        return Ok(v);
+                    }
+                    first_ok.get_or_insert(v);
+                }
+                from = start + 1;
+            }
+            None => break,
+        }
+    }
+    first_ok.ok_or_else(|| if text.contains('{') { "the reply was not valid JSON".to_string() } else { "the reply had no JSON object in it".to_string() })
 }
 
 /// Removes the thinking some models put in front of an answer (`<think>...</think>`).

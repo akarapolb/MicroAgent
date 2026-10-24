@@ -172,7 +172,7 @@ fn unusable_replies_are_retried_and_then_end_the_task() {
     let mut host = Script::new(&["I would love to help!", "Sure.", "Here you go.", "never reached"]);
     let out = run(&mut Agent::new(trusting(), tools()), &mut host, "t", "");
     assert!(matches!(out.stop, Stop::Failed(ref w) if w.contains("kept giving")), "{:?}", out.stop);
-    assert_eq!(host.asked.len(), 3);
+    assert_eq!(host.asked.len(), 4);
     // A good reply in between starts the count again.
     let mut host = Script::new(&["nope", r#"{"plan":["x"]}"#, "nope again", r#"{"final":"ok"}"#]);
     assert_eq!(run(&mut Agent::new(trusting(), tools()), &mut host, "t", "").stop, Stop::Done);
@@ -639,4 +639,26 @@ fn big_results_do_not_cause_a_summary_on_every_step() {
     // The prompt stays small all the same: old results are trimmed.
     let Step::Ask(req) = (match step { Step::Summarize(_) => agent.summary("s"), s => s }) else { panic!() };
     assert!(req.prompt.len() < 4000, "{}", req.prompt.len());
+}
+
+#[test]
+fn a_second_object_or_words_around_the_first_do_not_spoil_the_reply() {
+    let mut agent = Agent::new(Config { require_plan: false, ..Config::default() }, tools());
+    agent.start("t", "");
+    // A small model that writes the arguments twice: the first complete object is used.
+    let Step::Run(call) = agent.reply(r#"Sure! {"tool":"read","args":{"name":"a"}} {"name":"b"} hope that helps"#) else { panic!() };
+    assert_eq!(call.args, json!({"name": "a"}));
+    // Braces inside strings do not confuse it, and an object without an answer is skipped.
+    let mut agent = Agent::new(Config { require_plan: false, ..Config::default() }, tools());
+    agent.start("t", "");
+    let Step::Done(o) = agent.reply(r#"{"note":"x"} then {"final":"a } brace and a { brace inside"}"#) else { panic!() };
+    assert_eq!(o.summary, "a } brace and a { brace inside");
+}
+
+#[test]
+fn a_reply_without_a_tool_is_told_the_three_shapes() {
+    let mut agent = Agent::new(Config { require_plan: false, ..Config::default() }, tools());
+    agent.start("t", "");
+    let Step::Ask(req) = agent.reply(r#"{"args":{"cells":[]}}"#) else { panic!() };
+    assert!(req.prompt.contains(r#"{"tool":"<name>","args":{...}}"#) && req.prompt.contains(r#"{"final":"what was done"}"#), "{}", req.prompt);
 }
