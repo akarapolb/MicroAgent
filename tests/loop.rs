@@ -616,3 +616,27 @@ fn triggers_say_when_something_is_due() {
     }
     assert!(Trigger::from_json(r#"{"daily":[25,0]}"#).is_err() && Trigger::from_json(r#"{"every":0}"#).is_err() && Trigger::from_json("x").is_err());
 }
+
+#[test]
+fn big_results_do_not_cause_a_summary_on_every_step() {
+    // Each result is bigger than half the allowance: without a gap, every step would summarise.
+    let cfg = Config { require_plan: false, summarize: true, history_chars: 1500, max_calls: 60, ..Config::default() };
+    let mut agent = Agent::new(cfg, tools());
+    let mut step = agent.start("t", "");
+    let (mut asked, mut summaries) = (0, 0);
+    for i in 0..18 {
+        if let Step::Summarize(_) = step {
+            summaries += 1;
+            step = agent.summary("Short summary.");
+        }
+        let Step::Ask(_) = step else { panic!("{step:?}") };
+        asked += 1;
+        let Step::Run(call) = agent.reply(&format!(r#"{{"tool":"read","args":{{"name":"n{i}"}}}}"#)) else { panic!() };
+        step = agent.result(call.id, ToolOutput::ok("x".repeat(1200)));
+    }
+    assert_eq!(asked, 18);
+    assert!((1..=6).contains(&summaries), "{summaries} summaries in 18 steps");
+    // The prompt stays small all the same: old results are trimmed.
+    let Step::Ask(req) = (match step { Step::Summarize(_) => agent.summary("s"), s => s }) else { panic!() };
+    assert!(req.prompt.len() < 4000, "{}", req.prompt.len());
+}

@@ -12,6 +12,9 @@ pub const DELEGATE: &str = "delegate";
 /// itself: nothing for your app to run, only [`Agent::new_notes`] to store.
 pub const REMEMBER: &str = "remember";
 
+/// The fewest turns (a call and its result are two) added between one summary and the next.
+const MIN_TURNS_BETWEEN_SUMMARIES: usize = 6;
+
 /// The most notes shown to the model, and the longest note.
 const MAX_NOTES_SHOWN: usize = 20;
 const MAX_NOTE_CHARS: usize = 300;
@@ -163,6 +166,9 @@ pub struct Agent {
     memory: Vec<String>,
     new_notes: Vec<String>,
     memory_on: bool,
+    /// How many turns the history had right after the last summary, so summaries are not
+    /// asked for on every step when single results are big.
+    since_summary: usize,
     task: String,
     context: String,
     plan: Vec<String>,
@@ -195,6 +201,7 @@ impl Agent {
             memory: Vec::new(),
             new_notes: Vec::new(),
             memory_on: false,
+            since_summary: 0,
             task: String::new(),
             context: String::new(),
             plan: Vec::new(),
@@ -361,6 +368,7 @@ impl Agent {
         self.trace.push(Event { kind: "summary", text: text.clone() });
         self.turns.drain(..n.min(self.turns.len()));
         self.summary = text;
+        self.since_summary = self.turns.len();
         self.ask()
     }
 
@@ -371,6 +379,7 @@ impl Agent {
         };
         self.trace.push(Event { kind: "summary", text: "could not be made; the older steps were dropped".into() });
         self.turns.drain(..n.min(self.turns.len()));
+        self.since_summary = self.turns.len();
         self.ask()
     }
 
@@ -457,7 +466,9 @@ impl Agent {
     /// and the kept part starts on a model turn so a result is never cut from its call).
     fn fold_count(&self) -> Option<usize> {
         let total: usize = self.turns.iter().map(Agent::len_of).sum::<usize>() + self.summary.len();
-        if total <= self.cfg.history_chars || self.turns.len() < 4 {
+        // Not again until a few more steps have been taken: older results are still trimmed
+        // from the prompt meanwhile, so a summary is worth a call only now and then.
+        if total <= self.cfg.history_chars || self.turns.len() < 4 || self.turns.len() < self.since_summary + MIN_TURNS_BETWEEN_SUMMARIES {
             return None;
         }
         let (mut keep, mut size) = (0, 0);
@@ -732,7 +743,7 @@ impl Agent {
         json!({
             "v": 1, "task": self.task, "context": self.context, "plan": self.plan,
             "approved": self.approved, "confirmed": self.confirmed, "calls": self.calls,
-            "next_id": self.next_id, "bad": self.bad, "turns": turns, "summary": self.summary, "memory": self.memory, "new_notes": self.new_notes, "memory_on": self.memory_on,
+            "next_id": self.next_id, "bad": self.bad, "turns": turns, "summary": self.summary, "memory": self.memory, "new_notes": self.new_notes, "memory_on": self.memory_on, "since": self.since_summary,
             "phase": phase, "call": call, "outcome": outcome,
         })
         .to_string()
@@ -759,6 +770,7 @@ impl Agent {
         let notes = |k: &str| -> Vec<String> { v[k].as_array().map(|n| n.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default() };
         a.memory = notes("memory");
         a.new_notes = notes("new_notes");
+        a.since_summary = v["since"].as_u64().unwrap_or(0) as usize;
         if v["memory_on"].as_bool().unwrap_or(false) {
             a.add_remember_tool();
         }
