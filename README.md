@@ -138,6 +138,17 @@ let mut agent = Agent::new(Config::default(), r.tools_for(&all_tools));
 - **History** stays inside `history_chars`. Old turns are dropped whole so a call is never cut from its result, or, with `Config::summarize`, folded into a short summary the model writes (a `Step::Summarize`, which `Host::summarize` answers with an ordinary model call).
 - **A trace** (`agent.trace()`) of plan, calls, results and stops, for showing progress or keeping a record.
 
+## Which models work
+
+MicroAgent asks the model for one JSON object per turn, so the model has to follow a format. What it was tried with (a plan, two or three tool calls, then done):
+
+- **A strong model (a 27B model on vLLM with thinking off):** everything works, including specialists, memory and summaries.
+- **A 7B model (qwen2.5:7b on Ollama):** finishes simple tasks in a few calls, and makes the occasional mistake. With specialists it invents tool names and runs out of calls, so keep specialists for stronger models.
+- **A 3B model (qwen2.5:3b):** cannot keep to the format and fails after its retries.
+- **A small reasoning model (qwen3:4b):** too slow to answer in time on that machine. Turn a model's thinking off where you can.
+
+Unusable replies are retried with the reason (three times by default), and the first complete JSON object in a reply is used even when the model wrote words or a second object around it.
+
 ## What it deliberately does not do
 
 It does not talk to any model or service, store anything, schedule anything, or run tools in parallel. Those belong to your app, where they fit your architecture. It also does not make a model clever: a weak model will still make weak plans, so the approvals and limits are there on purpose.
