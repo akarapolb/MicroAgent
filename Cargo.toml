@@ -1,0 +1,12 @@
+[package]
+name = "microagent"
+description = "A tiny agent loop you can embed in any app: you bring the model and the tools, it brings the plan, the approvals, the limits and a snapshot you can resume from"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/akarapolb/MicroAgent"
+keywords = ["agent", "llm", "embed", "sans-io"]
+categories = ["algorithms"]
+
+[dependencies]
+serde_json = "1"
