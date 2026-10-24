@@ -662,3 +662,23 @@ fn a_reply_without_a_tool_is_told_the_three_shapes() {
     let Step::Ask(req) = agent.reply(r#"{"args":{"cells":[]}}"#) else { panic!() };
     assert!(req.prompt.contains(r#"{"tool":"<name>","args":{...}}"#) && req.prompt.contains(r#"{"final":"what was done"}"#), "{}", req.prompt);
 }
+
+#[test]
+fn arguments_written_beside_the_tool_name_are_still_taken() {
+    let mut agent = Agent::new(Config { require_plan: false, ..Config::default() }, tools());
+    agent.start("t", "");
+    // Flattened: no `args` at all.
+    let Step::Run(call) = agent.reply(r#"{"tool":"save","name":"a","text":"hello"}"#) else { panic!() };
+    assert_eq!(call.args, json!({"name": "a", "text": "hello"}));
+    agent.result(call.id, ToolOutput::ok("done"));
+    // Split between the two, with `args` winning, and unknown keys dropped.
+    let Step::Run(call) = agent.reply(r#"{"tool":"save","name":"x","thought":"hm","args":{"name":"b","text":"hi"}}"#) else { panic!() };
+    assert_eq!(call.args, json!({"name": "b", "text": "hi"}));
+}
+
+#[test]
+fn when_the_model_gives_up_the_failure_shows_what_it_last_sent() {
+    let mut host = Script::new(&["no", "still no", "nope", "{\"tool\":\"nothing\"}"]);
+    let out = run(&mut Agent::new(trusting(), tools()), &mut host, "t", "");
+    assert!(matches!(&out.stop, Stop::Failed(w) if w.contains("kept giving") && w.contains("its last reply began: {\"tool\":\"nothing\"}")), "{:?}", out.stop);
+}

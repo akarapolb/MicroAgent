@@ -320,7 +320,16 @@ impl Agent {
             return self.resume();
         }
         match self.read(text) {
-            Err(why) => self.bad_reply(&why),
+            Err(why) => {
+                let why = if self.bad >= self.cfg.bad_reply_limit {
+                    // The last try failed too: say what the model sent, to help whoever is looking.
+                    let snippet: String = text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect();
+                    format!("{why}; its last reply began: {snippet}")
+                } else {
+                    why
+                };
+                self.bad_reply(&why)
+            }
             Ok(action) => {
                 self.bad = 0;
                 self.act(action, text)
@@ -622,7 +631,22 @@ impl Agent {
             let names: Vec<&str> = self.visible().map(|t| t.name.as_str()).collect();
             format!("there is no tool called {name}; the tools are {}", names.join(", "))
         })?;
-        let args = tool.check(v.get("args").unwrap_or(&Value::Null))?;
+        // Some models put the arguments next to the tool name instead of inside `args`, or split
+        // them between the two: take both, with `args` winning.
+        let mut given = serde_json::Map::new();
+        if let Value::Object(o) = &v {
+            for (k, val) in o {
+                if k != "tool" && k != "args" {
+                    given.insert(k.clone(), val.clone());
+                }
+            }
+        }
+        if let Some(Value::Object(a)) = v.get("args") {
+            for (k, val) in a {
+                given.insert(k.clone(), val.clone());
+            }
+        }
+        let args = tool.check(&Value::Object(given))?;
         Ok(Action::Tool { name: name.to_owned(), args })
     }
 
