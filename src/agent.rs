@@ -51,6 +51,11 @@ pub struct Config {
     /// When the history outgrows `history_chars`, ask the model to summarise the older steps
     /// (a [`Step::Summarize`]) instead of dropping them. Off by default.
     pub summarize: bool,
+    /// The most tool calls one reply may ask for at once, for calls that do not depend on each
+    /// other (`{"tools":[...]}`). Each still comes as its own [`Step::Run`], with its own policy
+    /// check, and counts against `max_calls`; [`Agent::queued`] shows the rest of the batch so a
+    /// host can run them side by side. `1` (the default) keeps one call per reply.
+    pub max_batch: usize,
     /// Your own words for the model: what the app is, how to behave. Added to the instructions.
     pub instructions: String,
 }
@@ -68,6 +73,7 @@ impl Default for Config {
             check_plan_before_final: true,
             delegate_calls: 8,
             summarize: false,
+            max_batch: 1,
             instructions: String::new(),
         }
     }
@@ -193,12 +199,18 @@ pub struct Agent {
     summary: String,
     phase: Phase,
     trace: Vec<Event>,
+    /// The calls of the current batch still to run, and the results of those already run.
+    queue: Vec<ToolCall>,
+    batch_done: Vec<(ToolCall, String)>,
+    /// The reply that asked for the batch, kept for the history.
+    batch_reply: String,
 }
 
 enum Action {
     Plan(Vec<String>),
     Tool { name: String, args: Value },
     Final(String),
+    Batch(Vec<(String, Value)>),
 }
 
 impl Agent {
@@ -227,6 +239,9 @@ impl Agent {
             summary: String::new(),
             phase: Phase::Idle,
             trace: Vec::new(),
+            queue: Vec::new(),
+            batch_done: Vec::new(),
+            batch_reply: String::new(),
         }
     }
 
@@ -386,9 +401,27 @@ impl Agent {
         if call.id != id {
             return self.resume();
         }
-        self.turns.push(Turn::Model(json!({"tool": call.name, "args": call.args}).to_string()));
         let text = out.for_model();
         self.trace.push(Event { kind: "result", text: text.clone() });
+        if !self.batch_reply.is_empty() {
+            self.batch_done.push((call, text));
+            if !self.queue.is_empty() {
+                let next = self.queue.remove(0);
+                self.phase = Phase::Tool(next.clone());
+                return Step::Run(next);
+            }
+            // The whole batch has run: one turn for the reply, one for all its results.
+            let results: Vec<String> = self
+                .batch_done
+                .drain(..)
+                .enumerate()
+                .map(|(i, (c, r))| format!("{}. {} {}\n{r}", i + 1, c.name, c.args))
+                .collect();
+            self.turns.push(Turn::Model(std::mem::take(&mut self.batch_reply)));
+            self.turns.push(Turn::Result(results.join("\n\n")));
+            return self.ask();
+        }
+        self.turns.push(Turn::Model(json!({"tool": call.name, "args": call.args}).to_string()));
         self.turns.push(Turn::Result(text));
         self.ask()
     }
@@ -460,6 +493,13 @@ impl Agent {
     /// The plan the model proposed (empty until it has).
     pub fn plan(&self) -> &[String] {
         &self.plan
+    }
+
+    /// The calls of the current batch that come after the one in [`Step::Run`], in order. A host
+    /// may start them now, side by side, and give each result with [`Agent::result`] when the
+    /// agent asks for it. Empty outside a batch.
+    pub fn queued(&self) -> &[ToolCall] {
+        &self.queue
     }
 
     /// How many tool calls have been made.
@@ -635,6 +675,30 @@ impl Agent {
                 self.phase = Phase::Tool(call.clone());
                 Step::Run(call)
             }
+            Action::Batch(calls) => {
+                if !self.approved {
+                    return self.bad_reply("make a plan first");
+                }
+                if self.calls >= self.cfg.max_calls {
+                    return self.finish(Stop::CallLimit, String::new());
+                }
+                // As many as the call limit still allows; the model sees which ones ran.
+                let room = (self.cfg.max_calls - self.calls) as usize;
+                let mut made: Vec<ToolCall> = Vec::new();
+                for (name, args) in calls.into_iter().take(room) {
+                    let tool = self.visible().find(|t| t.name == name).expect("checked when read");
+                    let call = ToolCall { id: self.next_id, name, args, risk: tool.risk, ask: self.cfg.policy.asks(tool.risk) };
+                    self.next_id += 1;
+                    self.calls += 1;
+                    self.trace.push(Event { kind: "call", text: format!("{} {}", call.name, call.args) });
+                    made.push(call);
+                }
+                self.batch_reply = raw.trim().to_owned();
+                let first = made.remove(0);
+                self.queue = made;
+                self.phase = Phase::Tool(first.clone());
+                Step::Run(first)
+            }
             Action::Final(summary) => {
                 if self.cfg.check_plan_before_final && !self.confirmed && self.approved && (self.calls as usize) + 1 < self.plan.len() {
                     self.confirmed = true;
@@ -676,6 +740,38 @@ impl Agent {
         if let Some(f) = v.get("final") {
             return Ok(Action::Final(f.as_str().map(str::to_owned).unwrap_or_else(|| f.to_string())));
         }
+        if let Some(list) = v.get("tools") {
+            if self.cfg.max_batch <= 1 {
+                return Err(r#"one tool call per reply: {"tool":"<name>","args":{...}}"#.into());
+            }
+            let list = list.as_array().ok_or(r#"tools must be a list of {"tool":"<name>","args":{...}}"#)?;
+            if list.is_empty() {
+                return Err("tools is empty; name at least one call".into());
+            }
+            if list.len() > self.cfg.max_batch {
+                return Err(format!("at most {} calls at once", self.cfg.max_batch));
+            }
+            let mut calls = Vec::new();
+            for item in list {
+                let (name, args) = self.read_call(item)?;
+                if [DELEGATE, REMEMBER, USE_SKILL].contains(&name.as_str()) {
+                    return Err(format!("{name} goes in a reply of its own, not in a list of calls"));
+                }
+                calls.push((name, args));
+            }
+            return Ok(if calls.len() == 1 {
+                let (name, args) = calls.remove(0);
+                Action::Tool { name, args }
+            } else {
+                Action::Batch(calls)
+            });
+        }
+        let (name, args) = self.read_call(&v)?;
+        Ok(Action::Tool { name, args })
+    }
+
+    /// One `{"tool": .., "args": {..}}` object: the tool must exist and the arguments must pass.
+    fn read_call(&self, v: &Value) -> Result<(String, Value), String> {
         let name = v.get("tool").and_then(Value::as_str).ok_or(r#"the reply named no tool, plan or final. Reply with exactly one of {"plan":["step", ...]}, {"tool":"<name>","args":{...}} or {"final":"what was done"}"#)?;
         let tool = self.visible().find(|t| t.name == name).ok_or_else(|| {
             let names: Vec<&str> = self.visible().map(|t| t.name.as_str()).collect();
@@ -684,7 +780,7 @@ impl Agent {
         // Some models put the arguments next to the tool name instead of inside `args`, or split
         // them between the two: take both, with `args` winning.
         let mut given = serde_json::Map::new();
-        if let Value::Object(o) = &v {
+        if let Value::Object(o) = v {
             for (k, val) in o {
                 if k != "tool" && k != "args" {
                     given.insert(k.clone(), val.clone());
@@ -697,7 +793,7 @@ impl Agent {
             }
         }
         let args = tool.check(&Value::Object(given))?;
-        Ok(Action::Tool { name: name.to_owned(), args })
+        Ok((name.to_owned(), args))
     }
 
     // ------------------------------------------------------------ what the model is told
@@ -721,6 +817,12 @@ impl Agent {
         for t in self.visible() {
             s.push_str(&t.describe());
             s.push('\n');
+        }
+        if self.cfg.max_batch > 1 {
+            s.push_str(&format!(
+                "  {{\"tools\":[{{\"tool\":\"<name>\",\"args\":{{...}}}}, ...]}}  up to {} calls at once, only for calls that do not need each other's results\n",
+                self.cfg.max_batch
+            ));
         }
         s.push_str("  {\"final\":\"one or two sentences on what was done\"}\n");
         if !self.skills.is_empty() {
@@ -818,6 +920,9 @@ impl Agent {
             "v": 1, "task": self.task, "context": self.context, "plan": self.plan,
             "approved": self.approved, "confirmed": self.confirmed, "calls": self.calls,
             "next_id": self.next_id, "bad": self.bad, "turns": turns, "summary": self.summary, "memory": self.memory, "new_notes": self.new_notes, "memory_on": self.memory_on, "since": self.since_summary, "loaded": self.loaded,
+            "batch_reply": self.batch_reply,
+            "queue": self.queue.iter().map(|c| json!({"id": c.id, "name": c.name, "args": c.args})).collect::<Vec<_>>(),
+            "batch_done": self.batch_done.iter().map(|(c, r)| json!({"id": c.id, "name": c.name, "args": c.args, "result": r})).collect::<Vec<_>>(),
             "phase": phase, "call": call, "outcome": outcome,
         })
         .to_string()
@@ -848,6 +953,20 @@ impl Agent {
         a.loaded = v["loaded"].as_array().map(|n| n.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
         if v["memory_on"].as_bool().unwrap_or(false) {
             a.add_remember_tool();
+        }
+        a.batch_reply = text("batch_reply");
+        let call_of = |c: &Value, a: &Agent| -> Result<ToolCall, String> {
+            let name = c["name"].as_str().unwrap_or("");
+            let risk = a.tools.iter().find(|t| t.name == name).ok_or_else(|| format!("the snapshot needs the tool {name}, which is not registered"))?.risk;
+            Ok(ToolCall { id: c["id"].as_u64().unwrap_or(0) as u32, name: name.to_owned(), args: c["args"].clone(), risk, ask: a.cfg.policy.asks(risk) })
+        };
+        for c in v["queue"].as_array().into_iter().flatten() {
+            let call = call_of(c, &a)?;
+            a.queue.push(call);
+        }
+        for c in v["batch_done"].as_array().into_iter().flatten() {
+            let call = call_of(c, &a)?;
+            a.batch_done.push((call, c["result"].as_str().unwrap_or("").to_owned()));
         }
         for t in v["turns"].as_array().into_iter().flatten() {
             let body = t[1].as_str().unwrap_or("").to_owned();
@@ -932,7 +1051,7 @@ fn first_action_object(text: &str) -> Result<Value, String> {
         match end {
             Some(e) => {
                 if let Ok(v) = serde_json::from_str::<Value>(&text[start..=e]) {
-                    if v.get("plan").is_some() || v.get("tool").is_some() || v.get("final").is_some() {
+                    if v.get("plan").is_some() || v.get("tool").is_some() || v.get("tools").is_some() || v.get("final").is_some() {
                         return Ok(v);
                     }
                     first_ok.get_or_insert(v);

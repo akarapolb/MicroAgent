@@ -140,6 +140,22 @@ let agent = Agent::new(Config::default(), tools).with_skills(vec![skill]);
 
 The agent handles `use_skill` itself (there is nothing for your app to run), a task loads at most six, and loading is not counted against the call limit. Skills are plain text from whoever wrote them: read a skill before you add it, as you would any instructions you give the model.
 
+## Several calls at once
+
+Lookups that don't depend on each other can come in one reply. Set `Config::max_batch` above 1 (default 1, one call per reply) and the model may answer `{"tools":[{"tool":"read","args":{..}},{"tool":"read","args":{..}}]}`:
+
+```rust
+let cfg = Config { max_batch: 4, ..Config::default() };
+// ...
+Step::Run(call) => {
+    let rest = agent.queued().to_vec();       // the other calls of this batch, in order
+    let results = run_all_at_once(&call, &rest);  // your app may run them side by side
+    // then give each result with agent.result(id, out) as the agent asks for it
+}
+```
+
+Each call is still its own `Step::Run`, with its own policy check and approval, and counts against `max_calls` (a batch that would pass the limit is cut short). The model sees all the results together in its next turn. `delegate`, `remember` and `use_skill` go in a reply of their own. A snapshot taken in the middle of a batch resumes in the middle of it.
+
 ## What it handles for you
 
 - **A plan first**, approved once (`Config::require_plan`), with a step limit.
@@ -162,7 +178,7 @@ Unusable replies are retried with the reason (three times by default), and the f
 
 ## What it deliberately does not do
 
-It does not talk to any model or service, store anything, schedule anything, or run tools in parallel. Those belong to your app, where they fit your architecture. It also does not make a model clever: a weak model will still make weak plans, so the approvals and limits are there on purpose.
+It does not talk to any model or service, store anything, schedule anything, or run tools itself (a batch tells your app which calls it may run in parallel). Those belong to your app, where they fit your architecture. It also does not make a model clever: a weak model will still make weak plans, so the approvals and limits are there on purpose.
 
 ## Run the example
 

@@ -763,3 +763,87 @@ fn a_reply_cut_off_by_the_token_limit_is_told_to_write_less() {
     let Step::Ask(req) = agent.reply("{ not json }") else { panic!() };
     assert!(req.prompt.contains("not valid JSON"), "{}", req.prompt);
 }
+
+fn batching() -> Config {
+    Config { policy: Policy::TRUSTING, require_plan: false, max_batch: 3, ..Config::default() }
+}
+
+#[test]
+fn a_reply_may_ask_for_several_calls_and_the_model_sees_all_their_results() {
+    let mut agent = Agent::new(batching(), tools());
+    let Step::Ask(req) = agent.start("Read a and b", "") else { panic!() };
+    assert!(req.system.contains(r#"{"tools":[{"tool":"<name>""#) && req.system.contains("up to 3 calls at once"));
+    let Step::Run(a) = agent.reply(r#"{"tools":[{"tool":"read","args":{"name":"a"}},{"tool":"read","args":{"name":"b"}}]}"#) else { panic!() };
+    // The rest of the batch is known up front, so a host can start it now.
+    assert_eq!(agent.queued().len(), 1);
+    assert_eq!(agent.queued()[0].args, json!({"name": "b"}));
+    // The next call comes without asking the model.
+    let Step::Run(b) = agent.result(a.id, ToolOutput::ok("A says hi")) else { panic!() };
+    assert!(agent.queued().is_empty() && b.id != a.id);
+    let Step::Ask(req) = agent.result(b.id, ToolOutput::error("no such note")) else { panic!() };
+    assert!(req.prompt.contains("1. read") && req.prompt.contains("A says hi"), "{}", req.prompt);
+    assert!(req.prompt.contains("2. read") && req.prompt.contains("Failed: no such note"), "{}", req.prompt);
+    assert_eq!(agent.calls(), 2);
+    let Step::Done(o) = agent.reply(r#"{"final":"a says hi, b is missing"}"#) else { panic!() };
+    assert_eq!(o.stop, Stop::Done);
+}
+
+#[test]
+fn run_carries_out_a_batch_one_call_at_a_time_with_the_policy_for_each() {
+    let mut host = Script::new(&[
+        r#"{"tools":[{"tool":"read","args":{"name":"a"}},{"tool":"email","args":{"to":"x@y"}}]}"#,
+        r#"{"final":"done"}"#,
+    ]);
+    host.approve_calls = false;
+    let out = run(&mut Agent::new(batching(), tools()), &mut host, "t", "");
+    assert_eq!(out.stop, Stop::Done);
+    // The read ran; the email needed a yes, was refused, and the model was told.
+    assert_eq!(host.ran, vec![r#"read {"name":"a"}"#]);
+    assert_eq!(host.asked_about, vec!["email"]);
+    assert!(host.asked[1].prompt.contains("declined"));
+}
+
+#[test]
+fn batches_are_checked_and_bounded() {
+    let bad = |cfg: Config, reply: &str| {
+        let mut agent = Agent::new(cfg, tools());
+        agent.start("t", "");
+        let Step::Ask(req) = agent.reply(reply) else { panic!("{reply}") };
+        req.prompt
+    };
+    // Off by default: one call per reply.
+    assert!(bad(Config { require_plan: false, ..Config::default() }, r#"{"tools":[{"tool":"read","args":{"name":"a"}}]}"#).contains("one tool call per reply"));
+    // Too many, an unknown tool, bad arguments, an empty list.
+    let four = r#"{"tools":[{"tool":"read","args":{"name":"a"}},{"tool":"read","args":{"name":"b"}},{"tool":"read","args":{"name":"c"}},{"tool":"read","args":{"name":"d"}}]}"#;
+    assert!(bad(batching(), four).contains("at most 3 calls at once"));
+    assert!(bad(batching(), r#"{"tools":[{"tool":"read","args":{"name":"a"}},{"tool":"burn","args":{}}]}"#).contains("no tool called burn"));
+    assert!(bad(batching(), r#"{"tools":[{"tool":"read","args":{}},{"tool":"read","args":{"name":"b"}}]}"#).contains("args.name is missing"));
+    assert!(bad(batching(), r#"{"tools":[]}"#).contains("tools is empty"));
+    // A list of one is a plain call.
+    let mut agent = Agent::new(batching(), tools());
+    agent.start("t", "");
+    assert!(matches!(agent.reply(r#"{"tools":[{"tool":"read","args":{"name":"a"}}]}"#), Step::Run(_)));
+    assert!(agent.queued().is_empty());
+    // The call limit cuts a batch short and then ends the task.
+    let mut agent = Agent::new(Config { max_calls: 2, ..batching() }, tools());
+    agent.start("t", "");
+    let Step::Run(a) = agent.reply(r#"{"tools":[{"tool":"read","args":{"name":"a"}},{"tool":"read","args":{"name":"b"}},{"tool":"read","args":{"name":"c"}}]}"#) else { panic!() };
+    assert_eq!(agent.queued().len(), 1);
+    let Step::Run(b) = agent.result(a.id, ToolOutput::ok("x")) else { panic!() };
+    assert!(matches!(agent.result(b.id, ToolOutput::ok("y")), Step::Ask(_)));
+    let Step::Done(o) = agent.reply(r#"{"tool":"read","args":{"name":"d"}}"#) else { panic!() };
+    assert_eq!(o.stop, Stop::CallLimit);
+}
+
+#[test]
+fn a_half_run_batch_survives_a_restart() {
+    let mut agent = Agent::new(batching(), tools());
+    agent.start("t", "");
+    let Step::Run(a) = agent.reply(r#"{"tools":[{"tool":"read","args":{"name":"a"}},{"tool":"read","args":{"name":"b"}}]}"#) else { panic!() };
+    let Step::Run(b) = agent.result(a.id, ToolOutput::ok("first")) else { panic!() };
+    let mut agent = Agent::restore(batching(), tools(), &agent.snapshot()).unwrap();
+    let Step::Run(again) = agent.resume() else { panic!() };
+    assert_eq!(again, b);
+    let Step::Ask(req) = agent.result(b.id, ToolOutput::ok("second")) else { panic!() };
+    assert!(req.prompt.contains("first") && req.prompt.contains("second"));
+}
