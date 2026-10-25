@@ -682,3 +682,73 @@ fn when_the_model_gives_up_the_failure_shows_what_it_last_sent() {
     let out = run(&mut Agent::new(trusting(), tools()), &mut host, "t", "");
     assert!(matches!(&out.stop, Stop::Failed(w) if w.contains("kept giving") && w.contains("its last reply began: {\"tool\":\"nothing\"}")), "{:?}", out.stop);
 }
+
+fn skill(name: &str) -> microagent::Skill {
+    microagent::Skill::new(name, &format!("Use when the work is {name}."), &format!("Rules for {name}: be exact."))
+}
+
+#[test]
+fn skill_files_are_read_in_the_open_agent_skills_format() {
+    use microagent::Skill;
+    let s = Skill::parse("---\nname: slide-craft\ndescription: \"Use when making slides: one message per slide.\"\nlicense: MIT\nmetadata:\n  author: someone\n---\n\n# Slides\n\nOne message each.\n").unwrap();
+    assert_eq!((s.name.as_str(), s.description.as_str()), ("slide-craft", "Use when making slides: one message per slide."));
+    assert_eq!(s.body, "# Slides\n\nOne message each.");
+    // A folded description, and Windows line endings.
+    let f = Skill::parse("---\r\nname: x\r\ndescription: >\r\n  Use when a long\r\n  description is folded.\r\n---\r\nBody\r\n").unwrap();
+    assert_eq!(f.description, "Use when a long description is folded.");
+    assert_eq!(Skill::parse(&s.to_text()).unwrap(), s);
+    for bad in ["no header", "---\nname: x\n---\nbody", "---\nname: Bad Name\ndescription: d\n---\nbody", "---\nname: ok\ndescription: d\n---\n", "---\nname: a--b\ndescription: d\n---\nbody", "---\nname: ok\ndescription: d"] {
+        assert!(Skill::parse(bad).is_err(), "{bad:?}");
+    }
+    let long = format!("---\nname: big\ndescription: d\n---\n{}", "x".repeat(microagent::MAX_SKILL_CHARS + 1));
+    assert!(Skill::parse(&long).unwrap_err().contains("at most"));
+}
+
+#[test]
+fn the_model_sees_skill_names_and_loads_one_only_when_it_asks() {
+    let mut agent = Agent::new(Config { require_plan: false, ..Config::default() }, tools()).with_skills(vec![skill("slide-craft"), skill("crisp-writing")]);
+    let Step::Ask(req) = agent.start("t", "") else { panic!() };
+    assert!(req.system.contains("use_skill") && req.system.contains("slide-craft: Use when the work is slide-craft."));
+    assert!(!req.system.contains("Rules for slide-craft") && !req.prompt.contains("Rules for"), "the text is not sent until asked for");
+    let Step::Ask(next) = agent.reply(r#"{"tool":"use_skill","args":{"name":"Slide-Craft"}}"#) else { panic!() };
+    assert!(next.prompt.contains("Skill slide-craft:") && next.prompt.contains("Rules for slide-craft: be exact."));
+    assert_eq!(agent.calls(), 0, "loading a skill is not a call");
+    assert!(agent.trace().iter().any(|e| e.kind == "skill"));
+    // Again: told it is loaded. Unknown: told the names.
+    let Step::Ask(again) = agent.reply(r#"{"tool":"use_skill","args":{"name":"slide-craft"}}"#) else { panic!() };
+    assert!(again.prompt.contains("already loaded"));
+    let Step::Ask(unknown) = agent.reply(r#"{"tool":"use_skill","args":{"name":"nope"}}"#) else { panic!() };
+    assert!(unknown.prompt.contains("no skill called nope") && unknown.prompt.contains("crisp-writing"));
+    // The model may keep going with other tools afterwards.
+    assert!(matches!(agent.reply(r#"{"tool":"read","args":{"name":"a"}}"#), Step::Run(_)));
+}
+
+#[test]
+fn a_task_loads_at_most_six_skills_and_invalid_skills_are_left_out() {
+    let all: Vec<_> = (0..8).map(|i| skill(&format!("skill-{i}"))).collect();
+    let mut agent = Agent::new(Config { require_plan: false, ..Config::default() }, tools()).with_skills(all);
+    agent.start("t", "");
+    let mut last = String::new();
+    for i in 0..7 {
+        let Step::Ask(r) = agent.reply(&format!(r#"{{"tool":"use_skill","args":{{"name":"skill-{i}"}}}}"#)) else { panic!() };
+        last = r.prompt;
+    }
+    assert!(last.contains("Enough skills are loaded"));
+    let bad = microagent::Skill { name: "Bad Name".into(), description: "d".into(), body: "b".into() };
+    let mut agent = Agent::new(Config::default(), tools()).with_skills(vec![bad]);
+    let Step::Ask(req) = agent.start("t", "") else { panic!() };
+    assert!(!req.system.contains("use_skill"), "no valid skill, no tool");
+}
+
+#[test]
+fn loaded_skills_survive_a_restart() {
+    let cfg = || Config { require_plan: false, ..Config::default() };
+    let mut agent = Agent::new(cfg(), tools()).with_skills(vec![skill("crisp-writing")]);
+    agent.start("t", "");
+    agent.reply(r#"{"tool":"use_skill","args":{"name":"crisp-writing"}}"#);
+    let mut back = Agent::restore(cfg(), tools(), &agent.snapshot()).unwrap().with_skills(vec![skill("crisp-writing")]);
+    let Step::Ask(req) = back.resume() else { panic!() };
+    assert!(req.prompt.contains("Skill crisp-writing:"));
+    let Step::Ask(again) = back.reply(r#"{"tool":"use_skill","args":{"name":"crisp-writing"}}"#) else { panic!() };
+    assert!(again.prompt.contains("already loaded"));
+}

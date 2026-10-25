@@ -45,10 +45,12 @@ mod agent;
 mod host;
 mod recipe;
 mod schedule;
+mod skill;
 mod tool;
 
-pub use agent::{Agent, Config, Event, ModelRequest, Outcome, Step, Stop, DELEGATE, REMEMBER};
+pub use agent::{Agent, Config, Event, ModelRequest, Outcome, Step, Stop, DELEGATE, REMEMBER, USE_SKILL};
 pub use host::{run, Host};
 pub use recipe::{Param, Recipe, Specialist};
 pub use schedule::Trigger;
+pub use skill::{Skill, MAX_SKILL_CHARS};
 pub use tool::{Arg, Kind, Policy, Risk, Tool, ToolCall, ToolOutput};

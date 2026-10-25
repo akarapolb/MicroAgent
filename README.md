@@ -129,6 +129,17 @@ let mut agent = Agent::new(Config::default(), r.tools_for(&all_tools));
 
 **Triggers.** `Trigger::Every { minutes }`, `Daily { hour, minute }` and `Weekly { day, hour, minute }` say whether something is due: `trigger.due(last_run_ms, now_ms, utc_offset_minutes)`. It is plain arithmetic: your app owns the clock and decides what "due" does (run it, or only tell the person). Pass the time a schedule was made as its first `last_run_ms`, so a daily 09:00 created at 10:00 first fires tomorrow.
 
+## Skills
+
+A **skill** is an instruction pack in the open [Agent Skills](https://agentskills.io) format: a `SKILL.md` file with a `name` and a `description` in its header, then the instructions. Give the agent some and the model sees only each skill's name and description; it reads the full text with a `use_skill` tool when one fits the task, so a long guide costs nothing until it is used.
+
+```rust
+let skill = Skill::parse(&std::fs::read_to_string("slide-craft/SKILL.md")?)?;
+let agent = Agent::new(Config::default(), tools).with_skills(vec![skill]);
+```
+
+The agent handles `use_skill` itself (there is nothing for your app to run), a task loads at most six, and loading is not counted against the call limit. Skills are plain text from whoever wrote them: read a skill before you add it, as you would any instructions you give the model.
+
 ## What it handles for you
 
 - **A plan first**, approved once (`Config::require_plan`), with a step limit.

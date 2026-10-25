@@ -4,6 +4,7 @@
 use serde_json::{json, Value};
 
 use crate::recipe::Specialist;
+use crate::skill::Skill;
 use crate::tool::{Kind, Policy, Risk, Tool, ToolCall, ToolOutput};
 
 /// The name of the tool that hands work to a specialist. Reserved.
@@ -14,6 +15,13 @@ pub const REMEMBER: &str = "remember";
 
 /// The fewest turns (a call and its result are two) added between one summary and the next.
 const MIN_TURNS_BETWEEN_SUMMARIES: usize = 6;
+
+/// The name of the tool that loads a skill. Reserved. The agent handles it itself.
+pub const USE_SKILL: &str = "use_skill";
+
+/// The most skills one task may load, and the most of a skill's text given back at once.
+const MAX_SKILLS_LOADED: usize = 6;
+const MAX_SKILL_GIVEN: usize = 12_000;
 
 /// The most notes shown to the model, and the longest note.
 const MAX_NOTES_SHOWN: usize = 20;
@@ -166,6 +174,9 @@ pub struct Agent {
     memory: Vec<String>,
     new_notes: Vec<String>,
     memory_on: bool,
+    /// Skills the model may load, and the ones it has.
+    skills: Vec<Skill>,
+    loaded: Vec<String>,
     /// How many turns the history had right after the last summary, so summaries are not
     /// asked for on every step when single results are big.
     since_summary: usize,
@@ -201,6 +212,8 @@ impl Agent {
             memory: Vec::new(),
             new_notes: Vec::new(),
             memory_on: false,
+            skills: Vec::new(),
+            loaded: Vec::new(),
             since_summary: 0,
             task: String::new(),
             context: String::new(),
@@ -263,6 +276,22 @@ impl Agent {
         );
     }
 
+    /// Gives the model skills it can load with a `use_skill` tool. It is shown only each skill's
+    /// name and description; the full text is read when the model asks for it. The agent handles
+    /// the tool itself, so there is nothing for your app to run.
+    pub fn with_skills(mut self, skills: Vec<Skill>) -> Agent {
+        self.skills = skills.into_iter().filter(|s| s.check().is_ok()).collect();
+        self.tools.retain(|t| t.name != USE_SKILL);
+        if !self.skills.is_empty() {
+            self.tools.push(
+                Tool::new(USE_SKILL, "Read a skill: instructions for a kind of work, listed below. Load one when its description fits the task, before you start.")
+                    .arg("name", Kind::Text, "The skill's name")
+                    .risk(Risk::Read),
+            );
+        }
+        self
+    }
+
     /// What was remembered from earlier tasks (and anything added since).
     pub fn memory(&self) -> &[String] {
         &self.memory
@@ -283,7 +312,7 @@ impl Agent {
 
     /// The tools the lead model works with.
     fn visible(&self) -> impl Iterator<Item = &Tool> {
-        self.tools.iter().filter(move |t| t.name == DELEGATE || t.name == REMEMBER || self.lead.as_ref().is_none_or(|l| l.contains(&t.name)))
+        self.tools.iter().filter(move |t| t.name == DELEGATE || t.name == REMEMBER || t.name == USE_SKILL || self.lead.as_ref().is_none_or(|l| l.contains(&t.name)))
     }
 
     /// For a `delegate` call: a new agent for that specialist, already started, with the first
@@ -558,6 +587,27 @@ impl Agent {
                 if !self.approved {
                     return self.bad_reply("make a plan first");
                 }
+                if name == USE_SKILL {
+                    // Read by the agent itself: it does not count against the call limit.
+                    let wanted = args["name"].as_str().unwrap_or("").trim().to_lowercase();
+                    let reply = match self.skills.iter().find(|s| s.name == wanted) {
+                        None => {
+                            let names: Vec<&str> = self.skills.iter().map(|s| s.name.as_str()).collect();
+                            format!("There is no skill called {wanted}. The skills are {}.", names.join(", "))
+                        }
+                        Some(_) if self.loaded.contains(&wanted) => format!("The skill {wanted} is already loaded; its instructions are above."),
+                        Some(_) if self.loaded.len() >= MAX_SKILLS_LOADED => format!("Enough skills are loaded ({MAX_SKILLS_LOADED}); carry on with what you have."),
+                        Some(s) => {
+                            self.loaded.push(wanted.clone());
+                            self.trace.push(Event { kind: "skill", text: wanted.clone() });
+                            let body: String = s.body.chars().take(MAX_SKILL_GIVEN).collect();
+                            format!("Skill {wanted}:\n{body}{}", if s.body.chars().count() > MAX_SKILL_GIVEN { "\n(cut here)" } else { "" })
+                        }
+                    };
+                    self.turns.push(Turn::Model(raw.trim().to_owned()));
+                    self.turns.push(Turn::Result(reply));
+                    return self.ask();
+                }
                 if name == REMEMBER {
                     // Kept by the agent itself: no call to run, and it does not count against the limit.
                     let note = args["note"].as_str().unwrap_or("").to_owned();
@@ -673,6 +723,12 @@ impl Agent {
             s.push('\n');
         }
         s.push_str("  {\"final\":\"one or two sentences on what was done\"}\n");
+        if !self.skills.is_empty() {
+            s.push_str("Skills you can load with use_skill:\n");
+            for k in &self.skills {
+                s.push_str(&format!("  - {}: {}\n", k.name, k.description.chars().take(400).collect::<String>()));
+            }
+        }
         s.push_str("Look before you change anything. A change may be held for the person to approve; the next message tells you what happened. If a call fails, fix it or finish and say so.");
         s
     }
@@ -761,7 +817,7 @@ impl Agent {
         json!({
             "v": 1, "task": self.task, "context": self.context, "plan": self.plan,
             "approved": self.approved, "confirmed": self.confirmed, "calls": self.calls,
-            "next_id": self.next_id, "bad": self.bad, "turns": turns, "summary": self.summary, "memory": self.memory, "new_notes": self.new_notes, "memory_on": self.memory_on, "since": self.since_summary,
+            "next_id": self.next_id, "bad": self.bad, "turns": turns, "summary": self.summary, "memory": self.memory, "new_notes": self.new_notes, "memory_on": self.memory_on, "since": self.since_summary, "loaded": self.loaded,
             "phase": phase, "call": call, "outcome": outcome,
         })
         .to_string()
@@ -789,6 +845,7 @@ impl Agent {
         a.memory = notes("memory");
         a.new_notes = notes("new_notes");
         a.since_summary = v["since"].as_u64().unwrap_or(0) as usize;
+        a.loaded = v["loaded"].as_array().map(|n| n.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
         if v["memory_on"].as_bool().unwrap_or(false) {
             a.add_remember_tool();
         }
