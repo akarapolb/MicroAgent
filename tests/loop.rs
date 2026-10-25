@@ -847,3 +847,24 @@ fn a_half_run_batch_survives_a_restart() {
     let Step::Ask(req) = agent.result(b.id, ToolOutput::ok("second")) else { panic!() };
     assert!(req.prompt.contains("first") && req.prompt.contains("second"));
 }
+
+#[test]
+fn a_tool_named_under_another_key_is_still_found() {
+    let call = |reply: &str| {
+        let mut agent = Agent::new(Config { require_plan: false, ..trusting() }, tools());
+        agent.start("t", "");
+        match agent.reply(reply) {
+            Step::Run(c) => Ok((c.name, c.args)),
+            Step::Ask(req) => Err(req.prompt),
+            other => panic!("{other:?}"),
+        }
+    };
+    // "name" instead of "tool", with args beside or inside.
+    assert_eq!(call(r#"{"args":{"name":"a"},"name":"read"}"#).unwrap(), ("read".to_string(), json!({"name": "a"})));
+    assert_eq!(call(r#"{"function":"save","name":"b","text":"hi"}"#).unwrap(), ("save".to_string(), json!({"name": "b", "text": "hi"})));
+    // The tool as the key.
+    assert_eq!(call(r#"{"read":{"name":"a"}}"#).unwrap(), ("read".to_string(), json!({"name": "a"})));
+    assert_eq!(call(r#"{"read":{"args":{"name":"a"}}}"#).unwrap(), ("read".to_string(), json!({"name": "a"})));
+    // An argument that happens to be called "name" is not taken for the tool.
+    assert!(call(r#"{"name":"a"}"#).unwrap_err().contains("named no tool"));
+}

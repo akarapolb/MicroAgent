@@ -772,7 +772,23 @@ impl Agent {
 
     /// One `{"tool": .., "args": {..}}` object: the tool must exist and the arguments must pass.
     fn read_call(&self, v: &Value) -> Result<(String, Value), String> {
-        let name = v.get("tool").and_then(Value::as_str).ok_or(r#"the reply named no tool, plan or final. Reply with exactly one of {"plan":["step", ...]}, {"tool":"<name>","args":{...}} or {"final":"what was done"}"#)?;
+        // Where the tool's name is. Models don't always say "tool": some write "name" (or
+        // "tool_name", "function", "action"), some write {"<tool>": {..args..}}. Those are
+        // taken only when the value really is one of the tools, so an argument that happens
+        // to be called "name" is never mistaken for one.
+        let is_tool = |n: &str| self.visible().any(|t| t.name == n);
+        let (name, key, wrapped): (&str, &str, Option<&Value>) = if let Some(n) = v.get("tool").and_then(Value::as_str) {
+            (n, "tool", None)
+        } else if let Some((k, n)) = ["name", "tool_name", "function", "action"]
+            .iter()
+            .find_map(|k| v.get(*k).and_then(Value::as_str).filter(|n| is_tool(n)).map(|n| (*k, n)))
+        {
+            (n, k, None)
+        } else if let Some((n, inner)) = v.as_object().and_then(|o| o.iter().find(|(k, val)| val.is_object() && is_tool(k))) {
+            (n.as_str(), n.as_str(), Some(inner))
+        } else {
+            return Err(r#"the reply named no tool, plan or final. Reply with exactly one of {"plan":["step", ...]}, {"tool":"<name>","args":{...}} or {"final":"what was done"}"#.into());
+        };
         let tool = self.visible().find(|t| t.name == name).ok_or_else(|| {
             let names: Vec<&str> = self.visible().map(|t| t.name.as_str()).collect();
             format!("there is no tool called {name}; the tools are {}", names.join(", "))
@@ -780,18 +796,23 @@ impl Agent {
         // Some models put the arguments next to the tool name instead of inside `args`, or split
         // them between the two: take both, with `args` winning.
         let mut given = serde_json::Map::new();
-        if let Value::Object(o) = v {
+        if let Some(Value::Object(inner)) = wrapped {
+            for (k, val) in inner {
+                given.insert(k.clone(), val.clone());
+            }
+        } else if let Value::Object(o) = v {
             for (k, val) in o {
-                if k != "tool" && k != "args" {
+                if k != key && k != "args" {
                     given.insert(k.clone(), val.clone());
                 }
             }
         }
-        if let Some(Value::Object(a)) = v.get("args") {
+        if let Some(Value::Object(a)) = v.get("args").or_else(|| wrapped.and_then(|w| w.get("args"))) {
             for (k, val) in a {
                 given.insert(k.clone(), val.clone());
             }
         }
+        given.remove("args");
         let args = tool.check(&Value::Object(given))?;
         Ok((name.to_owned(), args))
     }
