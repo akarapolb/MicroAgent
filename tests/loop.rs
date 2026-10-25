@@ -752,3 +752,14 @@ fn loaded_skills_survive_a_restart() {
     let Step::Ask(again) = back.reply(r#"{"tool":"use_skill","args":{"name":"crisp-writing"}}"#) else { panic!() };
     assert!(again.prompt.contains("already loaded"));
 }
+
+#[test]
+fn a_reply_cut_off_by_the_token_limit_is_told_to_write_less() {
+    let mut agent = Agent::new(Config { require_plan: false, ..Config::default() }, tools());
+    agent.start("t", "");
+    let Step::Ask(req) = agent.reply(r#"{"tool":"save","args":{"name":"a","text":"a very long text that never gets to its end"#) else { panic!() };
+    assert!(req.prompt.contains("cut off") && req.prompt.contains("Write less in one call"), "{}", req.prompt);
+    // A reply that is simply wrong keeps its own message.
+    let Step::Ask(req) = agent.reply("{ not json }") else { panic!() };
+    assert!(req.prompt.contains("not valid JSON"), "{}", req.prompt);
+}

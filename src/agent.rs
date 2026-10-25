@@ -899,6 +899,7 @@ impl Agent {
 fn first_action_object(text: &str) -> Result<Value, String> {
     let bytes = text.as_bytes();
     let mut first_ok: Option<Value> = None;
+    let mut cut = false;
     let mut from = 0;
     while let Some(off) = text[from..].find('{') {
         let start = from + off;
@@ -938,10 +939,21 @@ fn first_action_object(text: &str) -> Result<Value, String> {
                 }
                 from = start + 1;
             }
-            None => break,
+            None => {
+                cut = true;
+                break;
+            }
         }
     }
-    first_ok.ok_or_else(|| if text.contains('{') { "the reply was not valid JSON".to_string() } else { "the reply had no JSON object in it".to_string() })
+    first_ok.ok_or_else(|| {
+        if cut {
+            "the reply was cut off before its JSON object ended, so it was too long. Write less in one call (for example fewer or shorter blocks) and make another call for the rest".to_string()
+        } else if text.contains('{') {
+            "the reply was not valid JSON".to_string()
+        } else {
+            "the reply had no JSON object in it".to_string()
+        }
+    })
 }
 
 /// Removes the thinking some models put in front of an answer (`<think>...</think>`).
