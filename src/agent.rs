@@ -786,6 +786,9 @@ impl Agent {
             (n, k, None)
         } else if let Some((n, inner)) = v.as_object().and_then(|o| o.iter().find(|(k, val)| val.is_object() && is_tool(k))) {
             (n.as_str(), n.as_str(), Some(inner))
+        } else if let Some(n) = self.tool_named_by_args(v) {
+            // No name anywhere, only arguments: the one tool they fit.
+            (n, "", None)
         } else {
             return Err(r#"the reply named no tool, plan or final. Reply with exactly one of {"plan":["step", ...]}, {"tool":"<name>","args":{...}} or {"final":"what was done"}"#.into());
         };
@@ -815,6 +818,26 @@ impl Agent {
         given.remove("args");
         let args = tool.check(&Value::Object(given))?;
         Ok((name.to_owned(), args))
+    }
+
+    /// For a reply that gives arguments but no tool name (`{"args":{"query":"x","limit":8}}`):
+    /// the single visible tool whose required arguments are all present and which declares
+    /// every argument given. Two tools fitting, or none, is no match, so a guess is never
+    /// made between tools.
+    fn tool_named_by_args(&self, v: &Value) -> Option<&str> {
+        let given: Vec<&str> = match v.get("args") {
+            Some(Value::Object(a)) if !a.is_empty() => a.keys().map(String::as_str).collect(),
+            _ => return None,
+        };
+        let mut fits = self.visible().filter(|t| {
+            t.name != DELEGATE
+                && t.name != REMEMBER
+                && t.name != USE_SKILL
+                && t.args.iter().filter(|a| a.required).all(|a| given.contains(&a.name.as_str()))
+                && given.iter().all(|g| t.args.iter().any(|a| a.name == *g))
+        });
+        let first = fits.next()?;
+        fits.next().is_none().then_some(first.name.as_str())
     }
 
     // ------------------------------------------------------------ what the model is told

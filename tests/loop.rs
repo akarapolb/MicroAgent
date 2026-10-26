@@ -868,3 +868,25 @@ fn a_tool_named_under_another_key_is_still_found() {
     // An argument that happens to be called "name" is not taken for the tool.
     assert!(call(r#"{"name":"a"}"#).unwrap_err().contains("named no tool"));
 }
+
+#[test]
+fn arguments_without_a_tool_name_are_matched_to_the_one_tool_they_fit() {
+    let call = |reply: &str| {
+        let mut agent = Agent::new(Config { require_plan: false, ..trusting() }, tools());
+        agent.start("t", "");
+        match agent.reply(reply) {
+            Step::Run(c) => Ok((c.name, c.args)),
+            Step::Ask(req) => Err(req.prompt),
+            other => panic!("{other:?}"),
+        }
+    };
+    // tools(): read(name), save(name, text, version?), email(to). Only `email` takes `to`.
+    assert_eq!(call(r#"{"args":{"to":"a@b.c"}}"#).unwrap(), ("email".to_string(), json!({"to": "a@b.c"})));
+    // `text` is declared by `save` alone, and `name` is its other required argument.
+    assert_eq!(call(r#"{"args":{"name":"n","text":"hi"}}"#).unwrap(), ("save".to_string(), json!({"name": "n", "text": "hi"})));
+    // `name` alone: `save` also needs `text`, so only `read` fits.
+    assert_eq!(call(r#"{"args":{"name":"n"}}"#).unwrap(), ("read".to_string(), json!({"name": "n"})));
+    // An argument no tool declares, or none at all: no guess.
+    assert!(call(r#"{"args":{"colour":"red"}}"#).unwrap_err().contains("named no tool"));
+    assert!(call(r#"{"args":{}}"#).unwrap_err().contains("named no tool"));
+}
