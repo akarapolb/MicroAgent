@@ -18,6 +18,9 @@ const MIN_TURNS_BETWEEN_SUMMARIES: usize = 6;
 
 /// The name of the tool that loads a skill. Reserved. The agent handles it itself.
 pub const USE_SKILL: &str = "use_skill";
+/// The name of the tool that asks the person a question. Reserved. The agent turns a call to it
+/// into [`Step::Question`]; see [`Agent::with_questions`].
+pub const ASK_USER: &str = "ask_user";
 
 /// The most skills one task may load, and the most of a skill's text given back at once.
 const MAX_SKILLS_LOADED: usize = 6;
@@ -86,6 +89,19 @@ pub struct ModelRequest {
     pub system: String,
     pub prompt: String,
     pub max_tokens: u32,
+    /// Files that go with the task (images, a scan), given to [`Agent::start_with`]. Send them
+    /// to a model that can read them, in whatever shape it takes.
+    pub attachments: Vec<Attachment>,
+}
+
+/// A file that goes with a task: an image, a scan, a document the model should look at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attachment {
+    pub name: String,
+    /// Its type, for example `image/png`.
+    pub mime: String,
+    /// The content: base64 text, or a URL, as your model call expects.
+    pub data: String,
 }
 
 /// What to do next.
@@ -101,8 +117,12 @@ pub enum Step {
     /// The model proposes this plan. Show it to the person, then call [`Agent::approve_plan`].
     Plan(Vec<String>),
     /// Run this tool, then call [`Agent::result`] with its output. If `call.ask` is true, the
-    /// person must say yes first; if they say no, give back [`ToolOutput::declined`].
+    /// person must say yes first (show them `call.summary`); if they say no, give back
+    /// [`ToolOutput::declined`].
     Run(ToolCall),
+    /// The model asks the person this question (only with [`Agent::with_questions`]). Wait for
+    /// their answer, which can take as long as it takes, then call [`Agent::answer`].
+    Question(String),
     /// The task is over.
     Done(Outcome),
 }
@@ -142,6 +162,10 @@ pub struct Outcome {
     pub summary: String,
     /// How many tool calls were made.
     pub calls: u32,
+    /// The whole final reply as a JSON object, when the model finished: `summary` is its `final`
+    /// text, and anything else it put beside it (a chart request, a list of sources) is here.
+    /// `Null` otherwise.
+    pub data: Value,
 }
 
 /// One line of the trace, for showing progress or keeping a record.
@@ -166,6 +190,8 @@ enum Phase {
     Summarize(usize),
     PlanApproval,
     Tool(ToolCall),
+    /// Waiting for the person's answer to this question.
+    Question(String),
     Done(Outcome),
 }
 
@@ -180,6 +206,12 @@ pub struct Agent {
     memory: Vec<String>,
     new_notes: Vec<String>,
     memory_on: bool,
+    /// Whether the model may ask the person questions, and the reply that asked the open one.
+    questions_on: bool,
+    pending_raw: String,
+    /// The final reply's JSON, held between reading it and finishing.
+    final_data: Value,
+    attachments: Vec<Attachment>,
     /// Skills the model may load, and the ones it has.
     skills: Vec<Skill>,
     loaded: Vec<String>,
@@ -209,7 +241,7 @@ pub struct Agent {
 enum Action {
     Plan(Vec<String>),
     Tool { name: String, args: Value },
-    Final(String),
+    Final(String, Value),
     Batch(Vec<(String, Value)>),
 }
 
@@ -224,6 +256,10 @@ impl Agent {
             memory: Vec::new(),
             new_notes: Vec::new(),
             memory_on: false,
+            questions_on: false,
+            pending_raw: String::new(),
+            final_data: Value::Null,
+            attachments: Vec::new(),
             skills: Vec::new(),
             loaded: Vec::new(),
             since_summary: 0,
@@ -307,6 +343,24 @@ impl Agent {
         self
     }
 
+    /// Lets the model ask the person a question when it cannot go on without the answer (which
+    /// of two things they mean, a missing detail). A question comes out as [`Step::Question`];
+    /// the agent waits, with nothing counted against the call limit, until [`Agent::answer`].
+    pub fn with_questions(mut self) -> Agent {
+        self.add_question_tool();
+        self
+    }
+
+    fn add_question_tool(&mut self) {
+        self.questions_on = true;
+        self.tools.retain(|t| t.name != ASK_USER);
+        self.tools.push(
+            Tool::new(ASK_USER, "Ask the person one short question when the task cannot go on without their answer (which of two things they mean, a missing detail). Not for anything you can look up.")
+                .arg("question", Kind::Text, "The question, in one sentence")
+                .risk(Risk::Read),
+        );
+    }
+
     /// What was remembered from earlier tasks (and anything added since).
     pub fn memory(&self) -> &[String] {
         &self.memory
@@ -327,7 +381,7 @@ impl Agent {
 
     /// The tools the lead model works with.
     fn visible(&self) -> impl Iterator<Item = &Tool> {
-        self.tools.iter().filter(move |t| t.name == DELEGATE || t.name == REMEMBER || t.name == USE_SKILL || self.lead.as_ref().is_none_or(|l| l.contains(&t.name)))
+        self.tools.iter().filter(move |t| t.name == DELEGATE || t.name == REMEMBER || t.name == USE_SKILL || t.name == ASK_USER || self.lead.as_ref().is_none_or(|l| l.contains(&t.name)))
     }
 
     /// For a `delegate` call: a new agent for that specialist, already started, with the first
@@ -353,9 +407,34 @@ impl Agent {
     /// Begins the task. `context` is whatever the model should know first (what is open, a
     /// document's text). Returns the first step, which is always [`Step::Ask`].
     pub fn start(&mut self, task: &str, context: &str) -> Step {
+        self.start_with(task, context, Vec::new())
+    }
+
+    /// [`Agent::start`] with files that go with the task. Every [`ModelRequest`] carries them.
+    pub fn start_with(&mut self, task: &str, context: &str, attachments: Vec<Attachment>) -> Step {
         self.task = task.trim().to_owned();
         self.context = context.trim().to_owned();
+        self.attachments = attachments;
         self.ask()
+    }
+
+    /// The person's answer to a [`Step::Question`].
+    pub fn answer(&mut self, text: &str) -> Step {
+        if !matches!(self.phase, Phase::Question(_)) {
+            return self.resume();
+        }
+        self.trace.push(Event { kind: "answer", text: text.trim().to_owned() });
+        self.turns.push(Turn::Model(std::mem::take(&mut self.pending_raw)));
+        self.turns.push(Turn::Result(format!("The person answered: {}", text.trim())));
+        self.ask()
+    }
+
+    /// The call as a person would read it: the tool's [`Tool::summary`], else name and arguments.
+    fn summary_for(&self, name: &str, args: &Value) -> String {
+        match self.tools.iter().find(|t| t.name == name) {
+            Some(t) => t.summary_of(args),
+            None => format!("{name} {args}"),
+        }
     }
 
     /// Gives the model's text. Returns the next step.
@@ -486,6 +565,7 @@ impl Agent {
             Phase::Summarize(n) => Step::Summarize(self.summary_request(n)),
             Phase::PlanApproval => Step::Plan(self.plan.clone()),
             Phase::Tool(call) => Step::Run(call),
+            Phase::Question(q) => Step::Question(q),
             Phase::Done(o) => Step::Done(o),
         }
     }
@@ -578,6 +658,7 @@ impl Agent {
         }
         p.push_str("\nWrite the new summary now.");
         ModelRequest {
+            attachments: Vec::new(),
             system: "You keep notes on a task so work can continue later. Write a short factual summary (under 200 words) of what has been done, what was found, and what is still to do. Keep exact names, numbers, cell references and file names. Reply with the summary only.".into(),
             prompt: p,
             max_tokens: self.cfg.max_tokens,
@@ -586,7 +667,7 @@ impl Agent {
 
     fn finish(&mut self, stop: Stop, summary: String) -> Step {
         self.trace.push(Event { kind: "stop", text: stop.label() });
-        let o = Outcome { stop, summary, calls: self.calls };
+        let o = Outcome { stop, summary, calls: self.calls, data: std::mem::take(&mut self.final_data) };
         self.phase = Phase::Done(o.clone());
         Step::Done(o)
     }
@@ -648,6 +729,14 @@ impl Agent {
                     self.turns.push(Turn::Result(reply));
                     return self.ask();
                 }
+                if name == ASK_USER {
+                    // Not a call to run, and it does not count against the limit: the person answers.
+                    let q = args["question"].as_str().unwrap_or("").trim().to_owned();
+                    self.trace.push(Event { kind: "question", text: q.clone() });
+                    self.pending_raw = raw.trim().to_owned();
+                    self.phase = Phase::Question(q.clone());
+                    return Step::Question(q);
+                }
                 if name == REMEMBER {
                     // Kept by the agent itself: no call to run, and it does not count against the limit.
                     let note = args["note"].as_str().unwrap_or("").to_owned();
@@ -662,13 +751,8 @@ impl Agent {
                     return self.finish(Stop::CallLimit, String::new());
                 }
                 let tool = self.visible().find(|t| t.name == name).expect("checked when read");
-                let call = ToolCall {
-                    id: self.next_id,
-                    name,
-                    args,
-                    risk: tool.risk,
-                    ask: self.cfg.policy.asks(tool.risk),
-                };
+                let (risk, summary) = (tool.risk, tool.summary_of(&args));
+                let call = ToolCall { id: self.next_id, name, args, risk, ask: self.cfg.policy.asks(risk), summary };
                 self.next_id += 1;
                 self.calls += 1;
                 self.trace.push(Event { kind: "call", text: format!("{} {}", call.name, call.args) });
@@ -687,7 +771,8 @@ impl Agent {
                 let mut made: Vec<ToolCall> = Vec::new();
                 for (name, args) in calls.into_iter().take(room) {
                     let tool = self.visible().find(|t| t.name == name).expect("checked when read");
-                    let call = ToolCall { id: self.next_id, name, args, risk: tool.risk, ask: self.cfg.policy.asks(tool.risk) };
+                    let (risk, summary) = (tool.risk, tool.summary_of(&args));
+                    let call = ToolCall { id: self.next_id, name, args, risk, ask: self.cfg.policy.asks(risk), summary };
                     self.next_id += 1;
                     self.calls += 1;
                     self.trace.push(Event { kind: "call", text: format!("{} {}", call.name, call.args) });
@@ -699,7 +784,7 @@ impl Agent {
                 self.phase = Phase::Tool(first.clone());
                 Step::Run(first)
             }
-            Action::Final(summary) => {
+            Action::Final(summary, data) => {
                 if self.cfg.check_plan_before_final && !self.confirmed && self.approved && (self.calls as usize) + 1 < self.plan.len() {
                     self.confirmed = true;
                     self.trace.push(Event { kind: "check", text: format!("{} calls for a plan of {} steps", self.calls, self.plan.len()) });
@@ -713,6 +798,7 @@ impl Agent {
                     return self.ask();
                 }
                 self.trace.push(Event { kind: "final", text: summary.clone() });
+                self.final_data = data;
                 self.finish(Stop::Done, summary)
             }
         }
@@ -738,7 +824,7 @@ impl Agent {
             return Ok(Action::Plan(steps));
         }
         if let Some(f) = v.get("final") {
-            return Ok(Action::Final(f.as_str().map(str::to_owned).unwrap_or_else(|| f.to_string())));
+            return Ok(Action::Final(f.as_str().map(str::to_owned).unwrap_or_else(|| f.to_string()), v.clone()));
         }
         if let Some(list) = v.get("tools") {
             if self.cfg.max_batch <= 1 {
@@ -754,7 +840,7 @@ impl Agent {
             let mut calls = Vec::new();
             for item in list {
                 let (name, args) = self.read_call(item)?;
-                if [DELEGATE, REMEMBER, USE_SKILL].contains(&name.as_str()) {
+                if [REMEMBER, USE_SKILL, ASK_USER].contains(&name.as_str()) {
                     return Err(format!("{name} goes in a reply of its own, not in a list of calls"));
                 }
                 calls.push((name, args));
@@ -843,7 +929,7 @@ impl Agent {
     // ------------------------------------------------------------ what the model is told
 
     fn request(&self) -> ModelRequest {
-        ModelRequest { system: self.system(), prompt: self.prompt(), max_tokens: self.cfg.max_tokens }
+        ModelRequest { system: self.system(), prompt: self.prompt(), max_tokens: self.cfg.max_tokens, attachments: self.attachments.clone() }
     }
 
     fn system(&self) -> String {
@@ -958,13 +1044,16 @@ impl Agent {
             Phase::Summarize(n) => ("summarize", json!(n), Value::Null),
             Phase::PlanApproval => ("plan", Value::Null, Value::Null),
             Phase::Tool(c) => ("tool", json!({"id": c.id, "name": c.name, "args": c.args}), Value::Null),
-            Phase::Done(o) => ("done", Value::Null, json!({"stop": o.stop.label(), "failed": matches!(o.stop, Stop::Failed(_)), "summary": o.summary})),
+            Phase::Question(q) => ("question", json!(q), Value::Null),
+            Phase::Done(o) => ("done", Value::Null, json!({"stop": o.stop.label(), "failed": matches!(o.stop, Stop::Failed(_)), "summary": o.summary, "data": o.data})),
         };
         json!({
             "v": 1, "task": self.task, "context": self.context, "plan": self.plan,
             "approved": self.approved, "confirmed": self.confirmed, "calls": self.calls,
             "next_id": self.next_id, "bad": self.bad, "turns": turns, "summary": self.summary, "memory": self.memory, "new_notes": self.new_notes, "memory_on": self.memory_on, "since": self.since_summary, "loaded": self.loaded,
             "batch_reply": self.batch_reply,
+            "questions_on": self.questions_on, "pending_raw": self.pending_raw,
+            "attachments": self.attachments.iter().map(|x| json!([x.name, x.mime, x.data])).collect::<Vec<_>>(),
             "queue": self.queue.iter().map(|c| json!({"id": c.id, "name": c.name, "args": c.args})).collect::<Vec<_>>(),
             "batch_done": self.batch_done.iter().map(|(c, r)| json!({"id": c.id, "name": c.name, "args": c.args, "result": r})).collect::<Vec<_>>(),
             "phase": phase, "call": call, "outcome": outcome,
@@ -999,10 +1088,21 @@ impl Agent {
             a.add_remember_tool();
         }
         a.batch_reply = text("batch_reply");
+        a.pending_raw = text("pending_raw");
+        if v["questions_on"].as_bool().unwrap_or(false) {
+            a.add_question_tool();
+        }
+        for x in v["attachments"].as_array().into_iter().flatten() {
+            a.attachments.push(Attachment {
+                name: x[0].as_str().unwrap_or("").to_owned(),
+                mime: x[1].as_str().unwrap_or("").to_owned(),
+                data: x[2].as_str().unwrap_or("").to_owned(),
+            });
+        }
         let call_of = |c: &Value, a: &Agent| -> Result<ToolCall, String> {
             let name = c["name"].as_str().unwrap_or("");
             let risk = a.tools.iter().find(|t| t.name == name).ok_or_else(|| format!("the snapshot needs the tool {name}, which is not registered"))?.risk;
-            Ok(ToolCall { id: c["id"].as_u64().unwrap_or(0) as u32, name: name.to_owned(), args: c["args"].clone(), risk, ask: a.cfg.policy.asks(risk) })
+            Ok(ToolCall { id: c["id"].as_u64().unwrap_or(0) as u32, name: name.to_owned(), args: c["args"].clone(), risk, ask: a.cfg.policy.asks(risk), summary: a.summary_for(name, &c["args"]) })
         };
         for c in v["queue"].as_array().into_iter().flatten() {
             let call = call_of(c, &a)?;
@@ -1034,8 +1134,10 @@ impl Agent {
                     args: v["call"]["args"].clone(),
                     risk,
                     ask: a.cfg.policy.asks(risk),
+                    summary: a.summary_for(name, &v["call"]["args"]),
                 })
             }
+            "question" => Phase::Question(v["call"].as_str().unwrap_or("").to_owned()),
             "done" => {
                 let label = v["outcome"]["stop"].as_str().unwrap_or("done").to_owned();
                 let stop = if v["outcome"]["failed"].as_bool().unwrap_or(false) {
@@ -1048,7 +1150,7 @@ impl Agent {
                         _ => Stop::Done,
                     }
                 };
-                Phase::Done(Outcome { stop, summary: v["outcome"]["summary"].as_str().unwrap_or("").to_owned(), calls: a.calls })
+                Phase::Done(Outcome { stop, summary: v["outcome"]["summary"].as_str().unwrap_or("").to_owned(), calls: a.calls, data: v["outcome"]["data"].clone() })
             }
             _ => Phase::Idle,
         };

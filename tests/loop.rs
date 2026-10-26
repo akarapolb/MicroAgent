@@ -494,7 +494,7 @@ fn an_unknown_specialist_is_sent_back_and_children_have_a_call_limit() {
     }
     assert!(matches!(child.reply(r#"{"tool":"read","args":{"name":"a"}}"#), Step::Done(o) if o.stop == Stop::CallLimit));
     // Only a delegation can start a child.
-    assert!(agent.start_child(&ToolCall { id: 9, name: "read".into(), args: json!({}), risk: Risk::Read, ask: false }).is_err());
+    assert!(agent.start_child(&ToolCall { id: 9, name: "read".into(), args: json!({}), risk: Risk::Read, ask: false, summary: String::new() }).is_err());
 }
 
 #[test]
@@ -889,4 +889,105 @@ fn arguments_without_a_tool_name_are_matched_to_the_one_tool_they_fit() {
     // An argument no tool declares, or none at all: no guess.
     assert!(call(r#"{"args":{"colour":"red"}}"#).unwrap_err().contains("named no tool"));
     assert!(call(r#"{"args":{}}"#).unwrap_err().contains("named no tool"));
+}
+
+use microagent::{Attachment, ASK_USER};
+
+#[test]
+fn a_call_reads_as_words_for_the_person_who_approves_it() {
+    let described = vec![
+        Tool::new("file_request", "File a purchase request")
+            .arg("what", Kind::Text, "What to buy")
+            .arg("amount", Kind::Number, "Baht")
+            .risk(Risk::Write)
+            .summary(|a| format!("File a purchase request for {} baht: {}", a["amount"], a["what"].as_str().unwrap_or(""))),
+        Tool::new("read", "Read a note").arg("name", Kind::Text, "Which note").risk(Risk::Read),
+    ];
+    let mut agent = Agent::new(Config { require_plan: false, ..Config::default() }, described.clone());
+    agent.start("t", "");
+    let Step::Run(call) = agent.reply(r#"{"tool":"file_request","args":{"what":"pumps","amount":"250000"}}"#) else { panic!() };
+    assert!(call.ask);
+    assert_eq!(call.summary, "File a purchase request for 250000 baht: pumps");
+    // Without a summary: the name and the arguments. Restored calls keep theirs.
+    let mut other = Agent::new(Config { require_plan: false, ..Config::default() }, described.clone());
+    other.start("t", "");
+    let Step::Run(c) = other.reply(r#"{"tool":"read","args":{"name":"a"}}"#) else { panic!() };
+    assert_eq!(c.summary, r#"read {"name":"a"}"#);
+    let mut back = Agent::restore(Config { require_plan: false, ..Config::default() }, described, &agent.snapshot()).unwrap();
+    let Step::Run(again) = back.resume() else { panic!() };
+    assert_eq!(again.summary, call.summary);
+}
+
+#[test]
+fn the_model_can_ask_the_person_and_wait_for_the_answer() {
+    let cfg = Config { require_plan: false, max_calls: 1, ..trusting() };
+    let mut agent = Agent::new(cfg.clone(), tools()).with_questions();
+    let Step::Ask(req) = agent.start("Copy the note", "") else { panic!() };
+    assert!(req.system.contains(ASK_USER));
+    let Step::Question(q) = agent.reply(r#"{"tool":"ask_user","args":{"question":"Which note?"}}"#) else { panic!() };
+    assert_eq!(q, "Which note?");
+    // A question is not a call: nothing is counted, and a restart mid-question comes back to it.
+    assert_eq!(agent.calls(), 0);
+    let mut back = Agent::restore(cfg, tools(), &agent.snapshot()).unwrap();
+    assert!(matches!(back.resume(), Step::Question(ref q) if q == "Which note?"));
+    // An answer at the wrong time just returns what the agent waits on.
+    assert!(matches!(agent.reply("{}"), Step::Question(_)));
+    let Step::Ask(req) = back.answer("note a") else { panic!() };
+    assert!(req.prompt.contains("The person answered: note a"), "{}", req.prompt);
+    // The call limit was not used up by asking.
+    assert!(matches!(back.reply(r#"{"tool":"read","args":{"name":"a"}}"#), Step::Run(_)));
+    // Without with_questions the tool does not exist.
+    let mut plain = Agent::new(Config { require_plan: false, ..trusting() }, tools());
+    plain.start("t", "");
+    let Step::Ask(req) = plain.reply(r#"{"tool":"ask_user","args":{"question":"?"}}"#) else { panic!() };
+    assert!(req.prompt.contains("no tool called ask_user"));
+}
+
+#[test]
+fn run_tells_the_model_when_the_person_cannot_be_asked() {
+    let mut host = Script::new(&[r#"{"tool":"ask_user","args":{"question":"Which one?"}}"#, r#"{"final":"I could not tell which one you meant."}"#]);
+    let out = run(&mut Agent::new(Config { require_plan: false, ..trusting() }, tools()).with_questions(), &mut host, "t", "");
+    assert_eq!(out.stop, Stop::Done);
+    assert!(host.asked[1].prompt.contains("cannot be asked right now"), "{}", host.asked[1].prompt);
+}
+
+#[test]
+fn the_whole_final_reply_comes_back_not_only_its_text() {
+    let cfg = Config { require_plan: false, ..trusting() };
+    let mut agent = Agent::new(cfg.clone(), tools());
+    agent.start("t", "");
+    let Step::Done(o) = agent.reply(r#"{"final":"Done.","chart":{"kind":"bar"},"sources":[1,2]}"#) else { panic!() };
+    assert_eq!(o.summary, "Done.");
+    assert_eq!(o.data["chart"]["kind"], "bar");
+    assert_eq!(o.data["sources"], json!([1, 2]));
+    let back = Agent::restore(cfg, tools(), &agent.snapshot()).unwrap();
+    assert_eq!(back.outcome().unwrap().data["chart"]["kind"], "bar");
+}
+
+#[test]
+fn files_travel_with_every_request_and_survive_a_restart() {
+    let cfg = Config { require_plan: false, ..trusting() };
+    let pic = Attachment { name: "scan.png".into(), mime: "image/png".into(), data: "aGk=".into() };
+    let mut agent = Agent::new(cfg.clone(), tools());
+    let Step::Ask(first) = agent.start_with("Read this scan", "", vec![pic.clone()]) else { panic!() };
+    assert_eq!(first.attachments, vec![pic.clone()]);
+    let Step::Run(c) = agent.reply(r#"{"tool":"read","args":{"name":"a"}}"#) else { panic!() };
+    let Step::Ask(second) = agent.result(c.id, ToolOutput::ok("x")) else { panic!() };
+    assert_eq!(second.attachments, vec![pic.clone()]);
+    let mut back = Agent::restore(cfg, tools(), &agent.snapshot()).unwrap();
+    let Step::Ask(third) = back.resume() else { panic!() };
+    assert_eq!(third.attachments, vec![pic]);
+}
+
+#[test]
+fn delegations_may_come_in_one_reply_so_a_host_can_run_the_specialists_side_by_side() {
+    let crew = vec![Specialist::new("reader", "Looks things up").tools(&["read"])];
+    let mut agent = Agent::new(Config { require_plan: false, max_batch: 3, ..trusting() }, tools()).with_specialists(crew);
+    agent.start("Review both notes", "");
+    let Step::Run(first) = agent.reply(r#"{"tools":[{"tool":"delegate","args":{"to":"reader","task":"note a"}},{"tool":"delegate","args":{"to":"reader","task":"note b"}}]}"#) else { panic!() };
+    assert_eq!(first.name, "delegate");
+    assert_eq!(agent.queued().len(), 1);
+    assert_eq!(agent.queued()[0].args["task"], "note b");
+    // Each is its own child agent the host can drive at the same time.
+    assert!(agent.start_child(&first).is_ok() && agent.start_child(&agent.queued()[0].clone()).is_ok());
 }

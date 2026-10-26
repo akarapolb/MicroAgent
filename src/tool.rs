@@ -128,9 +128,11 @@ pub struct Tool {
     /// An example call, shown to the model. Made from the arguments when you give none.
     pub example: Option<Value>,
     validator: Option<Validator>,
+    summarizer: Option<Summarizer>,
 }
 
 type Validator = Arc<dyn Fn(&Value) -> Result<Value, String> + Send + Sync>;
+type Summarizer = Arc<dyn Fn(&Value) -> String + Send + Sync>;
 
 impl fmt::Debug for Tool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -140,7 +142,7 @@ impl fmt::Debug for Tool {
 
 impl Tool {
     pub fn new(name: &str, help: &str) -> Tool {
-        Tool { name: name.to_owned(), help: help.to_owned(), risk: Risk::Read, args: Vec::new(), example: None, validator: None }
+        Tool { name: name.to_owned(), help: help.to_owned(), risk: Risk::Read, args: Vec::new(), example: None, validator: None, summarizer: None }
     }
 
     pub fn risk(mut self, risk: Risk) -> Tool {
@@ -158,6 +160,21 @@ impl Tool {
     pub fn opt(mut self, name: &str, kind: Kind, help: &str) -> Tool {
         self.args.push(Arg { name: name.to_owned(), kind, required: false, help: help.to_owned() });
         self
+    }
+
+    /// How a call to this tool reads to a person, for an approval card or a progress line:
+    /// "File a purchase request for 250,000 baht" rather than the tool name and its arguments.
+    /// Put on [`ToolCall::summary`]; without one it is the name and the arguments.
+    pub fn summary(mut self, describe: impl Fn(&Value) -> String + Send + Sync + 'static) -> Tool {
+        self.summarizer = Some(Arc::new(describe));
+        self
+    }
+
+    pub(crate) fn summary_of(&self, args: &Value) -> String {
+        match &self.summarizer {
+            Some(f) => f(args),
+            None => format!("{} {args}", self.name),
+        }
     }
 
     pub fn example(mut self, example: Value) -> Tool {
@@ -254,6 +271,9 @@ pub struct ToolCall {
     pub risk: Risk,
     /// True when the policy says the person must say yes first.
     pub ask: bool,
+    /// The call in words, for showing to a person: from [`Tool::summary`], else the name and the
+    /// arguments.
+    pub summary: String,
 }
 
 /// What a tool gave back, as text the model reads.

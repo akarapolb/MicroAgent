@@ -29,6 +29,13 @@ pub trait Host {
         true
     }
 
+    /// The model asked the person a question (only when the agent was given
+    /// [`Agent::with_questions`]). Return their answer, or `None` when they cannot be asked right
+    /// now; the model is then told to carry on with its best judgement.
+    fn ask_person(&mut self, _question: &str) -> Option<String> {
+        None
+    }
+
     /// Called for each trace event as it happens. Optional.
     fn event(&mut self, _event: &Event) {}
 }
@@ -61,6 +68,10 @@ fn drive(agent: &mut Agent, host: &mut impl Host, first: Step) -> Outcome {
                 let yes = host.approve_plan(&plan);
                 agent.approve_plan(yes)
             }
+            Step::Question(q) => match host.ask_person(&q) {
+                Some(a) => agent.answer(&a),
+                None => agent.answer("The person cannot be asked right now. Carry on with your best judgement, or finish and say what is unclear."),
+            },
             Step::Run(call) if call.name == DELEGATE => {
                 let out = match agent.start_child(&call) {
                     Ok((mut child, first)) => {

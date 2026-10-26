@@ -75,6 +75,7 @@ loop {
             let out = if call.ask && !person_says_yes(&call) { ToolOutput::declined() } else { run_my_tool(&call) };
             agent.result(call.id, out)
         }
+        Step::Question(q) => agent.answer(&ask_the_person(&q)),   // only with Agent::with_questions
         Step::Done(outcome) => break,
     };
 }
@@ -140,6 +141,15 @@ let agent = Agent::new(Config::default(), tools).with_skills(vec![skill]);
 
 The agent handles `use_skill` itself (there is nothing for your app to run), a task loads at most six, and loading is not counted against the call limit. Skills are plain text from whoever wrote them: read a skill before you add it, as you would any instructions you give the model.
 
+## Approvals, questions and files
+
+- **A call in words.** `Tool::new(..).summary(|args| format!("File a purchase request for {} baht", args["amount"]))` puts a readable line on `ToolCall::summary`, for the approval card a person sees when `call.ask` is true. Without one it is the tool name and its arguments.
+- **Asking the person.** `Agent::with_questions()` lets the model ask a short question when it cannot go on without the answer. It comes out as `Step::Question(text)`; wait as long as you like, then `agent.answer(text)`. A question is not a tool call and costs nothing against `max_calls`; a snapshot taken while waiting resumes at the question. With `run`, implement `Host::ask_person` (the default says the person cannot be asked, and the model carries on).
+- **Files with the task.** `agent.start_with(task, context, vec![Attachment { name, mime, data }])` puts the files on every `ModelRequest::attachments`, for a model that can read images or scans. They are kept in the snapshot.
+- **The whole final reply.** `Outcome::data` is the model's final object, so a chart request or a source list it put beside `final` is not lost; `Outcome::summary` is still its text.
+- **Specialists side by side.** `delegate` calls may share a `{"tools":[...]}` reply (see below); the host drives each child agent (`start_child`) at the same time.
+- **Streaming the answer.** `FinalStream` pulls the text of `{"final":"..."}` out of a reply while it is still arriving, decoding escapes as they complete: `let text = stream.feed(chunk);`.
+
 ## Several calls at once
 
 Lookups that don't depend on each other can come in one reply. Set `Config::max_batch` above 1 (default 1, one call per reply) and the model may answer `{"tools":[{"tool":"read","args":{..}},{"tool":"read","args":{..}}]}`:
@@ -154,7 +164,7 @@ Step::Run(call) => {
 }
 ```
 
-Each call is still its own `Step::Run`, with its own policy check and approval, and counts against `max_calls` (a batch that would pass the limit is cut short). The model sees all the results together in its next turn. `delegate`, `remember` and `use_skill` go in a reply of their own. A snapshot taken in the middle of a batch resumes in the middle of it.
+Each call is still its own `Step::Run`, with its own policy check and approval, and counts against `max_calls` (a batch that would pass the limit is cut short). The model sees all the results together in its next turn. `remember`, `use_skill` and `ask_user` go in a reply of their own. A snapshot taken in the middle of a batch resumes in the middle of it.
 
 ## What it handles for you
 
